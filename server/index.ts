@@ -3,10 +3,13 @@ import type {
   HexRow,
   PacketScenario,
   ParseRequest,
+  ParseTrace,
   Protocol,
   ProtocolField,
   SimulatedPacket,
-  TimelineEvent
+  TimelineEvent,
+  TraceStage,
+  TraceStageId
 } from '../shared/types.js';
 
 const app = express();
@@ -33,15 +36,17 @@ const TCP_SAMPLES: Record<PacketScenario, string> = {
   handshake: 'TCP 10.0.0.24:51842 > 10.0.0.8:443 | Seq=0 Ack=0 | Flags=SYN | Win=64240 | MSS=1460 | WS=7'
 };
 
-function hexDump(value: string): HexRow[] {
+function hexDump(value: string, highlight?: { from: number; to: number }): HexRow[] {
   const bytes = Array.from(Buffer.from(value, 'utf8'));
   const rows: HexRow[] = [];
   for (let index = 0; index < bytes.length; index += 16) {
     const slice = bytes.slice(index, index + 16);
+    const highlighted = highlight !== undefined && index < highlight.to && index + slice.length > highlight.from;
     rows.push({
       offset: index.toString(16).padStart(4, '0'),
       bytes: slice.map((byte) => byte.toString(16).padStart(2, '0')),
-      ascii: slice.map((byte) => (byte >= 32 && byte <= 126 ? String.fromCharCode(byte) : '.')).join('')
+      ascii: slice.map((byte) => (byte >= 32 && byte <= 126 ? String.fromCharCode(byte) : '.')).join(''),
+      ...(highlighted ? { highlight: true } : {})
     });
   }
   return rows;
@@ -108,14 +113,16 @@ function timelineFor(protocol: Protocol, scenario: PacketScenario): TimelineEven
   const steps = protocol === 'HTTP'
     ? [
         ['ingress', 'Frame captured', 'NIC received an application frame'],
-        ['parse', 'Headers indexed', 'Start line and header fields identified'],
-        ['application', `${prefix} payload decoded`, scenario === 'response' ? 'Response body is ready for inspection' : 'Request target and metadata extracted'],
+        ['parse', 'Start line identified', 'Request or status line tokenized into parts'],
+        ['parse', 'Headers decoded', 'Header fields indexed up to the blank line'],
+        ['application', `${prefix} payload formed`, scenario === 'response' ? 'Response body is ready for inspection' : 'Request body reconstructed after the header terminator'],
         ['egress', 'Inspector ready', 'Structured representation emitted by parse API']
       ]
     : [
         ['ingress', 'Segment captured', 'Transport segment received from the simulated wire'],
+        ['parse', 'Route identified', 'Source and destination endpoints parsed'],
         ['transport', 'TCP header decoded', 'Sequence, acknowledgement and flags extracted'],
-        ['parse', 'Layer tree assembled', 'Ethernet → IPv4 → TCP hierarchy created'],
+        ['application', 'Payload assembled', scenario === 'handshake' ? 'Handshake segment carries no payload' : 'Segment payload length recorded for inspection'],
         ['egress', 'Inspector ready', 'Structured representation emitted by parse API']
       ];
   return steps.map(([phase, label, detail], index) => ({
@@ -157,6 +164,113 @@ function buildPacket(protocol: Protocol, scenario: PacketScenario, raw: string):
   };
 }
 
+const TRACE_STAGE_LABELS: Array<{ id: TraceStageId; label: string }> = [
+  { id: 'capture', label: '抓取 · Capture' },
+  { id: 'identify', label: '识别 · Identify' },
+  { id: 'decode', label: '解码 · Decode' },
+  { id: 'payload', label: 'Payload · 组装' },
+  { id: 'output', label: '输出 · Output' }
+];
+
+function buildTrace(protocol: Protocol, scenario: PacketScenario, raw: string): ParseTrace {
+  const packet = buildPacket(protocol, scenario, raw);
+  const safeRaw = packet.raw;
+  const isHttp = protocol === 'HTTP';
+  const byteLength = (value: string) => Buffer.byteLength(value, 'utf8');
+  const totalBytes = byteLength(safeRaw);
+
+  // 各阶段已覆盖的字节范围，用于十六进制视图高亮与处理进度
+  let identifyEnd: number;
+  let decodeEnd: number;
+  if (isHttp) {
+    const lineBreak = /\r?\n/.exec(safeRaw);
+    const blankLine = /\r?\n\r?\n/.exec(safeRaw);
+    identifyEnd = byteLength(safeRaw.slice(0, lineBreak ? lineBreak.index + lineBreak[0].length : safeRaw.length));
+    decodeEnd = byteLength(safeRaw.slice(0, blankLine ? blankLine.index + blankLine[0].length : safeRaw.length));
+  } else {
+    identifyEnd = byteLength(safeRaw.split(' | ')[0]);
+    decodeEnd = totalBytes;
+  }
+
+  const highlights: Array<{ from: number; to: number } | undefined> = isHttp
+    ? [undefined, { from: 0, to: identifyEnd }, { from: identifyEnd, to: decodeEnd }, decodeEnd < totalBytes ? { from: decodeEnd, to: totalBytes } : undefined, undefined]
+    : [undefined, { from: 0, to: identifyEnd }, { from: identifyEnd, to: totalBytes }, undefined, undefined];
+
+  const allFields = packet.fields;
+  const stageFields: ProtocolField[][] = isHttp
+    ? [[], allFields.slice(0, 1), allFields.slice(0, 2), allFields, allFields]
+    : [[], allFields.slice(1, 2), allFields.slice(0, 3), allFields, allFields];
+
+  const processedBytes = [totalBytes, identifyEnd, decodeEnd, totalBytes, totalBytes];
+
+  const startLine = safeRaw.split(/\r?\n/)[0];
+  const route = safeRaw.split(' | ')[0];
+  const tcpValue = (key: string) => safeRaw.split(' | ').slice(1).find((part) => part.startsWith(`${key}=`))?.slice(key.length + 1) ?? '—';
+  const headerCount = isHttp ? Math.max(safeRaw.split(/\r?\n\r?\n/)[0].split(/\r?\n/).length - 1, 0) : 0;
+  const bodyBytes = isHttp ? totalBytes - decodeEnd : 0;
+
+  const summaries = isHttp
+    ? [
+        `已抓取 ${totalBytes} 字节 · 等待解析`,
+        `起始行：${startLine}`,
+        `已解码 ${headerCount} 个 Header 字段`,
+        `Payload 就绪 · ${bodyBytes} 字节`,
+        packet.summary
+      ]
+    : [
+        `已抓取 ${totalBytes} 字节 · 等待解析`,
+        `路由：${route}`,
+        `TCP 头部解码 · Flags=${tcpValue('Flags')}`,
+        `Payload 记录 · Len=${tcpValue('Len')}`,
+        packet.summary
+      ];
+
+  const captions = isHttp
+    ? [
+        '网卡抓取到原始字节流，此时尚未应用任何协议知识。',
+        `定位第一行起始行 “${startLine}”，并拆分为方法、目标与版本。`,
+        `逐行解析 ${headerCount} 个 Header 字段，直到遇到空行为止。`,
+        bodyBytes > 0 ? `空行之后的 ${bodyBytes} 字节组成应用层 Payload。` : '空行之后没有 Body，本包 Payload 为空。',
+        '全部层级解析完成，输出与“解析数据包”接口一致的结构化结果。'
+      ]
+    : [
+        '网卡抓取到原始字节流，此时尚未应用任何协议知识。',
+        `识别路由 “${route}”，确定通信的源与目的端点。`,
+        `解码 TCP 头部：Seq=${tcpValue('Seq')} Ack=${tcpValue('Ack')} Flags=${tcpValue('Flags')} Win=${tcpValue('Win')}。`,
+        `段内声明 Payload 长度 Len=${tcpValue('Len')}，内容为模拟的应用数据。`,
+        '全部层级解析完成，输出与“解析数据包”接口一致的结构化结果。'
+      ];
+
+  const stages: TraceStage[] = TRACE_STAGE_LABELS.map((stage, index) => ({
+    id: stage.id,
+    index,
+    label: stage.label,
+    caption: captions[index],
+    snapshot: {
+      summary: summaries[index],
+      fields: stageFields[index],
+      hex: hexDump(safeRaw, highlights[index]),
+      timeline: packet.timeline.slice(0, index + 1),
+      activeEventId: packet.timeline[index]?.id ?? null,
+      metadata: {
+        ...packet.metadata,
+        length: processedBytes[index],
+        checksum: index === TRACE_STAGE_LABELS.length - 1 ? packet.metadata.checksum : '—'
+      }
+    }
+  }));
+
+  return {
+    id: `trace-${packet.id}`,
+    protocol,
+    scenario,
+    raw: safeRaw,
+    generatedAt: packet.metadata.capturedAt,
+    stages,
+    packet
+  };
+}
+
 function isProtocol(value: unknown): value is Protocol { return value === 'HTTP' || value === 'TCP'; }
 function isScenario(value: unknown): value is PacketScenario { return value === 'request' || value === 'response' || value === 'handshake'; }
 
@@ -180,6 +294,18 @@ app.post('/api/parse', (request: Request<unknown, unknown, Partial<ParseRequest>
   const raw = typeof request.body?.raw === 'string' ? request.body.raw : '';
   if (!raw.trim()) return response.status(400).json({ error: 'raw is required' });
   response.json({ data: buildPacket(protocol, scenario, raw) });
+});
+
+app.post('/api/parse/trace', (request: Request<unknown, unknown, Partial<ParseRequest>>, response: Response) => {
+  const protocol = isProtocol(request.body?.protocol) ? request.body.protocol : 'HTTP';
+  const scenario = isScenario(request.body?.scenario) ? request.body.scenario : 'request';
+  const raw = typeof request.body?.raw === 'string' ? request.body.raw : '';
+  if (!raw.trim()) return response.status(400).json({ error: 'raw is required' });
+  try {
+    response.json({ data: buildTrace(protocol, scenario, raw) });
+  } catch {
+    response.status(500).json({ error: 'failed to build parse trace' });
+  }
 });
 
 app.listen(port, () => {
