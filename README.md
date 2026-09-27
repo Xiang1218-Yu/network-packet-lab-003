@@ -35,8 +35,21 @@ network-packet-lab/
 2. **数据包输入**：编辑原始 HTTP 文本或 TCP 模拟摘要，点击“解析数据包”重新生成可视化结果。
 3. **协议字段树**：HTTP 展示起始行、Header、Payload；TCP 展示 Ethernet、IPv4、TCP 和 Payload 层级，并支持折叠。
 4. **十六进制视图**：以 offset、hex bytes、ASCII 三列展示当前 payload 的 UTF-8 字节。
-5. **传输时间线**：展示抓包、解析、传输层解码和结构化输出等阶段。
-6. **解析 API / 模拟数据 API**：Express 服务提供 `/api/parse`、`/api/simulate`、`/api/packets` 和 `/api/health`。
+5. **传输时间线**：展示抓包、起始行/路由识别、Header/TCP 解码、Payload 形成和结构化输出五个阶段。
+6. **逐步回放（课堂演示）**：点击“逐步回放”后，服务端为当前输入生成带 5 个阶段快照的解析轨迹；播放器支持播放 / 暂停 / 单步前进 / 单步后退 / 回到起点，以及拖动进度条和点击阶段刻度跳转。字段树、摘要、元数据、十六进制视图（已解码字节高亮、未解析字节变暗）和时间线随当前阶段同步变化；结束后可“退出回放，回到普通解析结果”。
+7. **解析 API / 模拟数据 API**：Express 服务提供 `/api/parse`、`/api/replay`、`/api/simulate`、`/api/packets` 和 `/api/health`。
+
+### 回放阶段
+
+| # | HTTP | TCP |
+|---|------|-----|
+| ① 抓取 capture | 原始帧进入缓冲区，无字段、无事件 | 同左 |
+| ② 识别 identify | 切出 Request-Line / Status-Line | 解析源/目的路由，装入 IPv4 节点 |
+| ③ 解码 decode | 逐行解析 Header 字段 | 解码 Seq/Ack/Flags/Win（Len 待 Payload 阶段确定） |
+| ④ Payload | 空行之后的消息体形成 Payload | 依据 Len 附加段数据，Len=0 显示 (empty) |
+| ⑤ 最终输出 | 完整字段树、元数据、校验和（与 `/api/parse` 完全一致） | 同左 |
+
+空输入或阶段生成失败时，`/api/replay` 返回 4xx/5xx，前端会先清空上一包画面再提示错误，不会残留旧快照；回放中切换协议或场景会立即退出回放并加载新示例。
 
 ## 启动方式
 
@@ -87,6 +100,16 @@ curl -X POST 'http://localhost:3001/api/parse' \
   -H 'Content-Type: application/json' \
   -d '{"protocol":"HTTP","scenario":"request","raw":"GET /health HTTP/1.1\\r\\nHost: lab.local\\r\\n\\r\\n"}'
 ```
+
+### 生成逐步回放轨迹（含 5 个阶段快照）
+
+```bash
+curl -X POST 'http://localhost:3001/api/replay' \
+  -H 'Content-Type: application/json' \
+  -d '{"protocol":"TCP","scenario":"handshake","raw":"TCP 10.0.0.24:51842 > 10.0.0.8:443 | Seq=0 Ack=0 | Flags=SYN | Win=64240 | MSS=1460 | WS=7"}'
+```
+
+返回 `data.stages[]`，每个阶段带独立的 `fields / hex / revealedBytes / timeline / metadata / narration`；`data.final` 为最终结构化结果（与 `/api/parse` 等价）。空输入返回 `400`，阶段生成失败返回 `500`。
 
 ### 获取某协议的全部示例
 

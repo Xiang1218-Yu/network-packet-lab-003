@@ -46,3 +46,27 @@ export interface ParseRequest {
   scenario: PacketScenario;
   raw: string;
 }
+
+export type ReplayStageId = 'capture' | 'identify' | 'decode' | 'payload' | 'complete';
+
+export interface StageSnapshot {
+  stage: ReplayStageId;
+  index: number;
+  title: string;
+  narration: string;
+  raw: string;
+  summary: string;
+  fields: ProtocolField[];
+  hex: HexRow[];
+  revealedBytes: number;
+  timeline: TimelineEvent[];
+  metadata: SimulatedPacket['metadata'];
+}
+
+export interface ReplayTrajectory {
+  id: string;
+  protocol: Protocol;
+  scenario: PacketScenario;
+  stages: StageSnapshot[];
+  final: SimulatedPacket;
+}
